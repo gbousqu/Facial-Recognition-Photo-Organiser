@@ -866,3 +866,43 @@ class FaceDatabase:
                 'tag_name': row[5] if row[5] else None
             })
         return results
+
+    def get_all_tagged_faces_grouped_by_photo(self) -> List[Dict]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT p.photo_id, p.file_path,
+                   f.bbox_x1, f.bbox_y1, f.bbox_x2, f.bbox_y2,
+                   ft.tag_name
+            FROM photos p
+            JOIN faces f ON f.photo_id = p.photo_id
+            JOIN face_tags ft ON ft.face_id = f.face_id
+            WHERE p.scan_status = 'completed'
+            ORDER BY p.photo_id
+        ''')
+
+        grouped: List[Dict] = []
+        current_photo_id = None
+        current_entry = None
+
+        for row in cursor.fetchall():
+            photo_id = row[0]
+            if current_photo_id != photo_id:
+                current_photo_id = photo_id
+                current_entry = {
+                    'photo_id': photo_id,
+                    'file_path': row[1],
+                    'faces': []
+                }
+                grouped.append(current_entry)
+
+            current_entry['faces'].append({
+                'bbox_x1': row[2],
+                'bbox_y1': row[3],
+                'bbox_x2': row[4],
+                'bbox_y2': row[5],
+                'tag_name': row[6]
+            })
+
+        return grouped

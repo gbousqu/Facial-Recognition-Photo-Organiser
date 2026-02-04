@@ -25,6 +25,16 @@ let people = [];
         let lastSelectedIndex = -1;
         let nameConflictData = null;
         let showFaceTagsPreview = true;
+        let faceTagsScope = 'all';
+
+        let lightboxZoom = 1;
+        let lightboxPanX = 0;
+        let lightboxPanY = 0;
+        let lightboxDragging = false;
+        let lightboxDragStartX = 0;
+        let lightboxDragStartY = 0;
+        let lightboxDragStartPanX = 0;
+        let lightboxDragStartPanY = 0;
 
         const personColors = [
             '#667eea', '#f093fb', '#4facfe', '#43e97b', '#fa709a',
@@ -299,6 +309,42 @@ let people = [];
             }
         }
 
+        document.getElementById('exportXmpBtn').addEventListener('click', async () => {
+            const confirmExport = confirm('Export tagged faces to XMP sidecar files for all tagged photos?');
+            if (!confirmExport) {
+                return;
+            }
+
+            const exportBtn = document.getElementById('exportXmpBtn');
+            exportBtn.disabled = true;
+            const oldText = exportBtn.textContent;
+            exportBtn.textContent = 'Exporting...';
+
+            updateStatusMessage('Exporting XMP sidecars...');
+            document.getElementById('progressSection').style.display = 'flex';
+            closeSettings();
+
+            try {
+                const result = await pywebview.api.export_tagged_faces_to_xmp_sidecars();
+                if (result && result.success) {
+                    addLogEntry(`XMP export complete: ${result.exported}/${result.total} sidecars updated (${result.errors} errors, ${result.skipped_missing} missing files)`);
+                    alert(`XMP export complete.\n\nUpdated: ${result.exported}/${result.total}\nErrors: ${result.errors}\nMissing files: ${result.skipped_missing}`);
+                } else {
+                    const msg = (result && result.message) ? result.message : 'Unknown error';
+                    addLogEntry('ERROR: XMP export failed - ' + msg);
+                    alert('XMP export failed: ' + msg);
+                }
+            } catch (error) {
+                console.error('Error exporting XMP:', error);
+                addLogEntry('ERROR: XMP export failed - ' + error);
+                alert('XMP export failed. Please check the log for details.');
+            } finally {
+                exportBtn.disabled = false;
+                exportBtn.textContent = oldText;
+                hideProgress();
+            }
+        });
+
         async function loadPeople() {
             try {
                 people = await pywebview.api.get_people();
@@ -537,6 +583,7 @@ let people = [];
                     photoItem.innerHTML = `
                         <img src="${photo.thumbnail}" class="photo-placeholder" style="width: 100%; height: 100%; object-fit: cover;">
                         ${hiddenOverlay}
+                        <div class="grid-face-tags-overlay"></div>
                         <button class="kebab-menu">
                             <span class="kebab-dot"></span>
                             <span class="kebab-dot"></span>
@@ -680,6 +727,10 @@ let people = [];
                             closeAllMenus();
                         }, 200);
                     });
+
+                    photoItem.addEventListener('mouseenter', () => {
+                        renderGridFaceTags(photoItem, photo.face_id);
+                    });
                 });
                 
                 currentPage++;
@@ -731,6 +782,8 @@ let people = [];
             overlayContainer.innerHTML = '';
             overlayContainer.style.width = '0';
             overlayContainer.style.height = '0';
+
+            resetLightboxTransform();
             
             document.getElementById('lightboxOverlay').classList.remove('active');
             document.getElementById('appContainer').classList.remove('blurred');
@@ -753,41 +806,25 @@ let people = [];
         function drawFaceTags(faces, imageElement) {
             const overlayContainer = document.getElementById('faceTagsOverlay');
             overlayContainer.innerHTML = '';
-            
-            const imgRect = imageElement.getBoundingClientRect();
-            const contentRect = document.getElementById('lightboxContent').getBoundingClientRect();
-            
+
+            overlayContainer.style.left = '0px';
+            overlayContainer.style.top = '0px';
+            overlayContainer.style.width = imageElement.clientWidth + 'px';
+            overlayContainer.style.height = imageElement.clientHeight + 'px';
+
             const naturalWidth = imageElement.naturalWidth;
             const naturalHeight = imageElement.naturalHeight;
+
+            const scaleX = imageElement.clientWidth / naturalWidth;
+            const scaleY = imageElement.clientHeight / naturalHeight;
             
-            const imageAspect = naturalWidth / naturalHeight;
-            const containerAspect = imgRect.width / imgRect.height;
-            
-            let displayWidth, displayHeight, offsetX, offsetY;
-            
-            if (imageAspect > containerAspect) {
-                displayWidth = imgRect.width;
-                displayHeight = imgRect.width / imageAspect;
-                offsetX = 0;
-                offsetY = (imgRect.height - displayHeight) / 2;
-            } else {
-                displayHeight = imgRect.height;
-                displayWidth = imgRect.height * imageAspect;
-                offsetX = (imgRect.width - displayWidth) / 2;
-                offsetY = 0;
+            let facesToRender = faces;
+            const primaryFaceId = lightboxPhotos[lightboxCurrentIndex]?.face_id;
+            if (faceTagsScope === 'primary' && primaryFaceId) {
+                facesToRender = faces.filter(f => f.face_id === primaryFaceId);
             }
-            
-            overlayContainer.style.width = displayWidth + 'px';
-            overlayContainer.style.height = displayHeight + 'px';
-            overlayContainer.style.left = (imgRect.left - contentRect.left + offsetX) + 'px';
-            overlayContainer.style.top = (imgRect.top - contentRect.top + offsetY) + 'px';
-            
-            const scaleX = displayWidth / naturalWidth;
-            const scaleY = displayHeight / naturalHeight;
-            
-            faces.forEach(face => {
-                if (!face.tag_name) return;
-                
+
+            facesToRender.forEach(face => {
                 const x1 = face.bbox_x1 * scaleX;
                 const y1 = face.bbox_y1 * scaleY;
                 const x2 = face.bbox_x2 * scaleX;
@@ -803,10 +840,12 @@ let people = [];
                 box.style.width = width + 'px';
                 box.style.height = height + 'px';
                 
-                const label = document.createElement('div');
-                label.className = 'face-tag-label';
-                label.textContent = face.tag_name;
-                box.appendChild(label);
+                if (face.tag_name) {
+                    const label = document.createElement('div');
+                    label.className = 'face-tag-label';
+                    label.textContent = face.tag_name;
+                    box.appendChild(label);
+                }
                 
                 overlayContainer.appendChild(box);
             });
@@ -823,6 +862,8 @@ let people = [];
             overlayContainer.innerHTML = '';
             overlayContainer.style.width = '0';
             overlayContainer.style.height = '0';
+
+            resetLightboxTransform();
             
             try {
                 const lightboxImage = document.getElementById('lightboxImage');
@@ -859,6 +900,121 @@ let people = [];
         }
 
         document.getElementById('lightboxClose').addEventListener('click', closeLightbox);
+
+        function applyLightboxTransform() {
+            const media = document.getElementById('lightboxMedia');
+            if (!media) return;
+            media.style.transform = `translate(${lightboxPanX}px, ${lightboxPanY}px) scale(${lightboxZoom})`;
+            clampLightboxPan();
+
+            const zoomSlider = document.getElementById('lightboxZoomSlider');
+            const zoomValue = document.getElementById('lightboxZoomValue');
+            if (zoomSlider) zoomSlider.value = Math.round(lightboxZoom * 100);
+            if (zoomValue) zoomValue.textContent = `${Math.round(lightboxZoom * 100)}%`;
+        }
+
+        function clampLightboxPan() {
+            const content = document.getElementById('lightboxContent');
+            const media = document.getElementById('lightboxMedia');
+            if (!content || !media) return;
+
+            const contentRect = content.getBoundingClientRect();
+            const mediaRect = media.getBoundingClientRect();
+
+            if (mediaRect.width <= contentRect.width) {
+                lightboxPanX = 0;
+            } else {
+                if (mediaRect.left > contentRect.left) {
+                    lightboxPanX -= (mediaRect.left - contentRect.left);
+                }
+                if (mediaRect.right < contentRect.right) {
+                    lightboxPanX += (contentRect.right - mediaRect.right);
+                }
+            }
+
+            if (mediaRect.height <= contentRect.height) {
+                lightboxPanY = 0;
+            } else {
+                if (mediaRect.top > contentRect.top) {
+                    lightboxPanY -= (mediaRect.top - contentRect.top);
+                }
+                if (mediaRect.bottom < contentRect.bottom) {
+                    lightboxPanY += (contentRect.bottom - mediaRect.bottom);
+                }
+            }
+
+            media.style.transform = `translate(${lightboxPanX}px, ${lightboxPanY}px) scale(${lightboxZoom})`;
+        }
+
+        function setLightboxZoom(newZoom) {
+            const media = document.getElementById('lightboxMedia');
+            if (!media) return;
+
+            lightboxZoom = Math.max(1, Math.min(4, newZoom));
+
+            applyLightboxTransform();
+        }
+
+        function resetLightboxTransform() {
+            lightboxZoom = 1;
+            lightboxPanX = 0;
+            lightboxPanY = 0;
+
+            const media = document.getElementById('lightboxMedia');
+            if (media) {
+                media.classList.remove('dragging');
+                media.style.transform = 'translate(0px, 0px) scale(1)';
+            }
+
+            const zoomSlider = document.getElementById('lightboxZoomSlider');
+            const zoomValue = document.getElementById('lightboxZoomValue');
+            if (zoomSlider) zoomSlider.value = 100;
+            if (zoomValue) zoomValue.textContent = '100%';
+        }
+
+        document.getElementById('lightboxZoomSlider').addEventListener('input', (e) => {
+            setLightboxZoom(parseInt(e.target.value) / 100);
+        });
+
+        document.getElementById('lightboxZoomReset').addEventListener('click', () => {
+            resetLightboxTransform();
+        });
+
+        document.getElementById('lightboxContent').addEventListener('wheel', (e) => {
+            if (!document.getElementById('lightboxOverlay').classList.contains('active')) return;
+            e.preventDefault();
+
+            const delta = e.deltaY;
+            const factor = delta > 0 ? 0.92 : 1.08;
+            setLightboxZoom(lightboxZoom * factor);
+        }, { passive: false });
+
+        document.getElementById('lightboxMedia').addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            lightboxDragging = true;
+            lightboxDragStartX = e.clientX;
+            lightboxDragStartY = e.clientY;
+            lightboxDragStartPanX = lightboxPanX;
+            lightboxDragStartPanY = lightboxPanY;
+            document.getElementById('lightboxMedia').classList.add('dragging');
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!lightboxDragging) return;
+            const dx = e.clientX - lightboxDragStartX;
+            const dy = e.clientY - lightboxDragStartY;
+            lightboxPanX = lightboxDragStartPanX + dx;
+            lightboxPanY = lightboxDragStartPanY + dy;
+            applyLightboxTransform();
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (!lightboxDragging) return;
+            lightboxDragging = false;
+            const media = document.getElementById('lightboxMedia');
+            if (media) media.classList.remove('dragging');
+        });
+
 
         document.getElementById('lightboxOverlay').addEventListener('click', (e) => {
             if (e.target === document.getElementById('lightboxOverlay')) {
@@ -1051,9 +1207,10 @@ let people = [];
             addLogEntry(message);
         }
 
-        function updateProgress(current, total, percent) {
+        function updateProgress(current, total, percent, label) {
             document.getElementById('progressFill').style.width = percent + '%';
-            document.getElementById('progressText').textContent = `Scanning: ${current}/${total}`;
+            const prefix = label || 'Scanning';
+            document.getElementById('progressText').textContent = `${prefix}: ${current}/${total}`;
         }
 
         function hideProgress() {
@@ -1081,7 +1238,112 @@ let people = [];
             logViewer.scrollTop = logViewer.scrollHeight;
         }
 
+        function setShowFaceTagsEnabled(enabled) {
+            showFaceTagsPreview = enabled;
 
+            const settingsToggle = document.getElementById('showFaceTagsPreviewToggle');
+            if (settingsToggle) {
+                settingsToggle.checked = enabled;
+            }
+
+            const headerToggle = document.getElementById('showFaceTagsToggle');
+            if (headerToggle) {
+                headerToggle.checked = enabled;
+            }
+
+            if (!enabled) {
+                document.querySelectorAll('.grid-face-tags-overlay').forEach(el => {
+                    el.innerHTML = '';
+                });
+
+                const overlayContainer = document.getElementById('faceTagsOverlay');
+                if (overlayContainer) {
+                    overlayContainer.innerHTML = '';
+                    overlayContainer.style.width = '0';
+                    overlayContainer.style.height = '0';
+                }
+            }
+        }
+
+        function setFaceTagsScope(scope) {
+            faceTagsScope = scope;
+
+            const primaryOnlyToggle = document.getElementById('faceTagsPrimaryOnlyToggle');
+            if (primaryOnlyToggle) {
+                primaryOnlyToggle.checked = scope === 'primary';
+            }
+        }
+
+        async function renderGridFaceTags(photoItem, faceId) {
+            try {
+                if (!showFaceTagsPreview) return;
+
+                const overlay = photoItem.querySelector('.grid-face-tags-overlay');
+                if (!overlay) return;
+
+                const imgEl = photoItem.querySelector('img.photo-placeholder');
+                if (!imgEl) return;
+
+                if (!imgEl.complete || !imgEl.naturalWidth || !imgEl.naturalHeight) {
+                    imgEl.onload = () => {
+                        renderGridFaceTags(photoItem, faceId);
+                    };
+                    return;
+                }
+
+                overlay.innerHTML = '';
+
+                const result = await pywebview.api.get_grid_face_boxes(faceId);
+                if (!result || !result.success) return;
+
+                let faces = result.faces || [];
+                if (faceTagsScope === 'primary') {
+                    faces = faces.filter(f => f.is_primary);
+                }
+
+                const tileWidth = photoItem.clientWidth;
+                const tileHeight = photoItem.clientHeight;
+
+                const srcWidth = imgEl.naturalWidth;
+                const srcHeight = imgEl.naturalHeight;
+
+                const scale = Math.max(tileWidth / srcWidth, tileHeight / srcHeight);
+                const displayWidth = srcWidth * scale;
+                const displayHeight = srcHeight * scale;
+
+                const offsetX = (tileWidth - displayWidth) / 2;
+                const offsetY = (tileHeight - displayHeight) / 2;
+
+                faces.forEach(face => {
+                    const x1 = face.bbox_x1 * scale + offsetX;
+                    const y1 = face.bbox_y1 * scale + offsetY;
+                    const x2 = face.bbox_x2 * scale + offsetX;
+                    const y2 = face.bbox_y2 * scale + offsetY;
+
+                    const width = x2 - x1;
+                    const height = y2 - y1;
+
+                    const box = document.createElement('div');
+                    box.className = 'face-tag-box';
+                    box.style.left = x1 + 'px';
+                    box.style.top = y1 + 'px';
+
+                    box.style.width = width + 'px';
+                    box.style.height = height + 'px';
+
+                    if (face.tag_name) {
+                        const label = document.createElement('div');
+                        label.className = 'face-tag-label';
+                        label.textContent = face.tag_name;
+                        box.appendChild(label);
+                    }
+
+                    overlay.appendChild(box);
+                });
+            } catch (error) {
+                console.error('Error rendering grid face tags:', error);
+            }
+        }
 
         async function loadAllSettings() {
             try {
@@ -1129,15 +1391,52 @@ let people = [];
                 
                 const showFaceTagsPreviewSetting = await pywebview.api.get_show_face_tags_preview();
                 showFaceTagsPreview = showFaceTagsPreviewSetting;
-                document.getElementById('showFaceTagsPreviewToggle').addEventListener('change', async (e) => {
-                    showFaceTagsPreview = e.target.checked;
-                    await pywebview.api.set_show_face_tags_preview(showFaceTagsPreview);
-                    
+                setShowFaceTagsEnabled(showFaceTagsPreviewSetting);
+
+                const scopeSetting = await pywebview.api.get_face_tags_scope();
+                setFaceTagsScope(scopeSetting);
+
+                const settingsFaceTagsToggle = document.getElementById('showFaceTagsPreviewToggle');
+                settingsFaceTagsToggle.addEventListener('change', async (e) => {
+                    const enabled = e.target.checked;
+                    setShowFaceTagsEnabled(enabled);
+                    await pywebview.api.set_show_face_tags_preview(enabled);
+
                     if (document.getElementById('lightboxOverlay').classList.contains('active')) {
                         await updateLightbox();
                     }
-                    
-                    addLogEntry('Show face tags in preview: ' + (showFaceTagsPreview ? 'enabled' : 'disabled'));
+
+                    addLogEntry('Show face tags: ' + (enabled ? 'enabled' : 'disabled'));
+                });
+
+                const headerFaceTagsToggle = document.getElementById('showFaceTagsToggle');
+                headerFaceTagsToggle.addEventListener('change', async (e) => {
+                    const enabled = e.target.checked;
+                    setShowFaceTagsEnabled(enabled);
+                    await pywebview.api.set_show_face_tags_preview(enabled);
+
+                    if (document.getElementById('lightboxOverlay').classList.contains('active')) {
+                        await updateLightbox();
+                    }
+
+                    addLogEntry('Show face tags: ' + (enabled ? 'enabled' : 'disabled'));
+                });
+
+                const primaryOnlyToggle = document.getElementById('faceTagsPrimaryOnlyToggle');
+                primaryOnlyToggle.addEventListener('change', async (e) => {
+                    const scope = e.target.checked ? 'primary' : 'all';
+                    setFaceTagsScope(scope);
+                    await pywebview.api.set_face_tags_scope(scope);
+
+                    document.querySelectorAll('.grid-face-tags-overlay').forEach(el => {
+                        el.innerHTML = '';
+                    });
+
+                    if (document.getElementById('lightboxOverlay').classList.contains('active')) {
+                        await updateLightbox();
+                    }
+
+                    addLogEntry('Face tags scope: ' + (scope === 'primary' ? 'primary only' : 'all faces'));
                 });
                 
                 const gridSize = await pywebview.api.get_grid_size();

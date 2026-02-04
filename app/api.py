@@ -4,9 +4,10 @@ import base64
 import threading
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 from io import BytesIO
 from PIL import Image, ImageOps
+import xml.etree.ElementTree as ET
 import torch
 import webview
 import pystray
@@ -580,6 +581,199 @@ class API:
                 os.system(f'xdg-open "{path}"')
         except Exception as e:
             print(f"Error opening photo: {e}")
+
+    def export_tagged_faces_to_xmp_sidecars(self):
+        try:
+            photos = self._db.get_all_tagged_faces_grouped_by_photo()
+            total = len(photos)
+
+            if total == 0:
+                self.update_status("XMP export: no tagged faces found")
+                return {
+                    'success': True,
+                    'total': 0,
+                    'exported': 0,
+                    'skipped_missing': 0,
+                    'errors': 0
+                }
+
+            ET.register_namespace('x', 'adobe:ns:meta/')
+            ET.register_namespace('rdf', 'http://www.w3.org/1999/02/22-rdf-syntax-ns#')
+            ET.register_namespace('mwg-rs', 'http://www.metadataworkinggroup.com/schemas/regions/')
+            ET.register_namespace('stArea', 'http://ns.adobe.com/xmp/sType/Area#')
+            ET.register_namespace('stDim', 'http://ns.adobe.com/xap/1.0/sType/Dimensions#')
+
+            exported = 0
+            skipped_missing = 0
+            errors = 0
+
+            for idx, item in enumerate(photos, start=1):
+                file_path = item['file_path']
+
+                percent = (idx / total) * 100 if total > 0 else 0
+                if self._window:
+                    safe_label = "Exporting XMP".replace('"', '\\"')
+                    self._window.evaluate_js(f'updateProgress({idx}, {total}, {percent}, "{safe_label}")')
+
+                if not os.path.exists(file_path):
+                    skipped_missing += 1
+                    continue
+
+                try:
+                    with Image.open(file_path) as pil_img:
+                        pil_img = ImageOps.exif_transpose(pil_img)
+                        width, height = pil_img.size
+
+                    faces = item.get('faces', [])
+                    faces = [f for f in faces if f.get('tag_name')]
+                    if not faces:
+                        continue
+
+                    sidecar_path = str(Path(file_path).with_suffix('.xmp'))
+                    xmp_root = self._load_existing_xmp_root(sidecar_path)
+                    self._upsert_mwg_regions(xmp_root, faces, width, height)
+                    self._write_xmp_sidecar(sidecar_path, xmp_root)
+                    exported += 1
+                except Exception as e:
+                    errors += 1
+                    self.update_status(f"XMP export error: {os.path.basename(file_path)}: {str(e)}")
+
+            self.update_status(f"XMP export complete: {exported}/{total} sidecars updated")
+            return {
+                'success': True,
+                'total': total,
+                'exported': exported,
+                'skipped_missing': skipped_missing,
+                'errors': errors
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    def _extract_xmp_xml(self, content: str) -> Optional[str]:
+        start = content.find('<x:xmpmeta')
+        if start == -1:
+            start = content.find('<xmpmeta')
+        if start == -1:
+            return None
+
+        end = content.rfind('</x:xmpmeta>')
+        if end != -1:
+            end += len('</x:xmpmeta>')
+        else:
+            end = content.rfind('</xmpmeta>')
+            if end != -1:
+                end += len('</xmpmeta>')
+
+        if end == -1 or end <= start:
+            return None
+
+        return content[start:end]
+
+    def _load_existing_xmp_root(self, sidecar_path: str) -> ET.Element:
+        if os.path.exists(sidecar_path):
+            try:
+                with open(sidecar_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                xml = self._extract_xmp_xml(content)
+                if xml:
+                    return ET.fromstring(xml)
+            except Exception:
+                pass
+
+        xmp_ns = 'adobe:ns:meta/'
+        rdf_ns = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+
+        root = ET.Element(f'{{{xmp_ns}}}xmpmeta')
+        rdf = ET.SubElement(root, f'{{{rdf_ns}}}RDF')
+        desc = ET.SubElement(rdf, f'{{{rdf_ns}}}Description')
+        desc.set(f'{{{rdf_ns}}}about', '')
+        return root
+
+    def _upsert_mwg_regions(self, xmp_root: ET.Element, faces: List[Dict], width: int, height: int):
+        rdf_ns = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+        mwg_ns = 'http://www.metadataworkinggroup.com/schemas/regions/'
+        st_area_ns = 'http://ns.adobe.com/xmp/sType/Area#'
+        st_dim_ns = 'http://ns.adobe.com/xap/1.0/sType/Dimensions#'
+
+        rdf = xmp_root.find(f'.//{{{rdf_ns}}}RDF')
+        if rdf is None:
+            rdf = ET.SubElement(xmp_root, f'{{{rdf_ns}}}RDF')
+
+        desc = rdf.find(f'./{{{rdf_ns}}}Description')
+        if desc is None:
+            desc = ET.SubElement(rdf, f'{{{rdf_ns}}}Description')
+            desc.set(f'{{{rdf_ns}}}about', '')
+
+        for child in list(desc):
+            if child.tag == f'{{{mwg_ns}}}Regions':
+                desc.remove(child)
+
+        regions = ET.SubElement(desc, f'{{{mwg_ns}}}Regions')
+        regions_desc = ET.SubElement(regions, f'{{{rdf_ns}}}Description')
+
+        applied = ET.SubElement(regions_desc, f'{{{mwg_ns}}}AppliedToDimensions')
+        applied_desc = ET.SubElement(applied, f'{{{rdf_ns}}}Description')
+        applied_desc.set(f'{{{st_dim_ns}}}w', str(width))
+        applied_desc.set(f'{{{st_dim_ns}}}h', str(height))
+        applied_desc.set(f'{{{st_dim_ns}}}unit', 'pixel')
+
+        region_list = ET.SubElement(regions_desc, f'{{{mwg_ns}}}RegionList')
+        bag = ET.SubElement(region_list, f'{{{rdf_ns}}}Bag')
+
+        w = float(width) if width else 1.0
+        h = float(height) if height else 1.0
+
+        for face in faces:
+            x1 = float(face['bbox_x1'])
+            y1 = float(face['bbox_y1'])
+            x2 = float(face['bbox_x2'])
+            y2 = float(face['bbox_y2'])
+
+            x1 = max(0.0, min(w, x1))
+            x2 = max(0.0, min(w, x2))
+            y1 = max(0.0, min(h, y1))
+            y2 = max(0.0, min(h, y2))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            cx = ((x1 + x2) / 2.0) / w
+            cy = ((y1 + y2) / 2.0) / h
+            aw = (x2 - x1) / w
+            ah = (y2 - y1) / h
+
+            li = ET.SubElement(bag, f'{{{rdf_ns}}}li')
+            li.set(f'{{{rdf_ns}}}parseType', 'Resource')
+
+            name_el = ET.SubElement(li, f'{{{mwg_ns}}}Name')
+            name_el.text = str(face['tag_name'])
+
+            type_el = ET.SubElement(li, f'{{{mwg_ns}}}Type')
+            type_el.text = 'Face'
+
+            area = ET.SubElement(li, f'{{{mwg_ns}}}Area')
+            area.set(f'{{{st_area_ns}}}x', f"{cx:.6f}")
+            area.set(f'{{{st_area_ns}}}y', f"{cy:.6f}")
+            area.set(f'{{{st_area_ns}}}w', f"{aw:.6f}")
+            area.set(f'{{{st_area_ns}}}h', f"{ah:.6f}")
+            area.set(f'{{{st_area_ns}}}unit', 'normalized')
+
+    def _write_xmp_sidecar(self, sidecar_path: str, xmp_root: ET.Element):
+        tree = ET.ElementTree(xmp_root)
+        try:
+            ET.indent(tree, space="  ")
+        except Exception:
+            pass
+
+        xml_bytes = ET.tostring(xmp_root, encoding='utf-8', xml_declaration=True)
+        xml_text = xml_bytes.decode('utf-8', errors='replace')
+
+        xpacket_header = "<?xpacket begin=\"\ufeff\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
+        xpacket_footer = "\n<?xpacket end=\"w\"?>\n"
+        payload = (xpacket_header + xml_text + xpacket_footer).encode('utf-8')
+
+        with open(sidecar_path, 'wb') as f:
+            f.write(payload)
     
     def save_log(self, log_content):
         try:
@@ -853,15 +1047,14 @@ class API:
             
             tagged_faces = []
             for face in faces:
-                if face['tag_name']:
-                    tagged_faces.append({
-                        'face_id': face['face_id'],
-                        'bbox_x1': face['bbox_x1'] * scale_x,
-                        'bbox_y1': face['bbox_y1'] * scale_y,
-                        'bbox_x2': face['bbox_x2'] * scale_x,
-                        'bbox_y2': face['bbox_y2'] * scale_y,
-                        'tag_name': face['tag_name']
-                    })
+                tagged_faces.append({
+                    'face_id': face['face_id'],
+                    'bbox_x1': face['bbox_x1'] * scale_x,
+                    'bbox_y1': face['bbox_y1'] * scale_y,
+                    'bbox_x2': face['bbox_x2'] * scale_x,
+                    'bbox_y2': face['bbox_y2'] * scale_y,
+                    'tag_name': face.get('tag_name')
+                })
             
             return {'success': True, 'faces': tagged_faces}
         except Exception as e:
@@ -875,6 +1068,89 @@ class API:
 
     def set_show_face_tags_preview(self, enabled):
         self._settings.set('show_face_tags_preview', enabled)
+
+    def get_grid_face_boxes(self, face_id: int):
+        try:
+            face_data = self._db.get_face_data(face_id)
+            if not face_data:
+                return {'success': False, 'faces': []}
+
+            grid_size = self._settings.get('grid_size', 180)
+            view_mode = self._settings.get('view_mode', 'entire_photo')
+
+            photo_id = face_data['photo_id']
+            image_path = face_data['file_path']
+            primary_bbox = [face_data['bbox_x1'], face_data['bbox_y1'], face_data['bbox_x2'], face_data['bbox_y2']]
+
+            faces = self._db.get_photo_face_tags(photo_id)
+
+            img = Image.open(image_path)
+            img = ImageOps.exif_transpose(img)
+
+            crop_x1 = 0
+            crop_y1 = 0
+            crop_x2 = img.width
+            crop_y2 = img.height
+
+            if view_mode == 'zoom_to_faces':
+                x1, y1, x2, y2 = primary_bbox
+                padding = 20
+
+                crop_x1 = max(0, x1 - padding)
+                crop_y1 = max(0, y1 - padding)
+                crop_x2 = min(img.width, x2 + padding)
+                crop_y2 = min(img.height, y2 + padding)
+
+                img = img.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
+
+            crop_width = img.width
+            crop_height = img.height
+
+            thumb = img.copy()
+            thumb.thumbnail((grid_size, grid_size), Image.Resampling.LANCZOS)
+
+            scale_x = thumb.width / crop_width if crop_width else 1
+            scale_y = thumb.height / crop_height if crop_height else 1
+
+            result_faces = []
+            for face in faces:
+                fx1 = face['bbox_x1'] - crop_x1
+                fy1 = face['bbox_y1'] - crop_y1
+                fx2 = face['bbox_x2'] - crop_x1
+                fy2 = face['bbox_y2'] - crop_y1
+
+                if fx2 <= 0 or fy2 <= 0 or fx1 >= crop_width or fy1 >= crop_height:
+                    continue
+
+                fx1 = max(0, min(crop_width, fx1))
+                fy1 = max(0, min(crop_height, fy1))
+                fx2 = max(0, min(crop_width, fx2))
+                fy2 = max(0, min(crop_height, fy2))
+
+                result_faces.append({
+                    'face_id': face['face_id'],
+                    'bbox_x1': fx1 * scale_x,
+                    'bbox_y1': fy1 * scale_y,
+                    'bbox_x2': fx2 * scale_x,
+                    'bbox_y2': fy2 * scale_y,
+                    'tag_name': face.get('tag_name'),
+                    'is_primary': face['face_id'] == face_id
+                })
+
+            return {'success': True, 'faces': result_faces}
+        except Exception as e:
+            print(f"Error getting grid face boxes: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'faces': []}
+
+    def get_face_tags_scope(self):
+        return self._settings.get('face_tags_scope', 'all')
+
+    def set_face_tags_scope(self, scope):
+        if scope not in ('all', 'primary'):
+            return
+        self._settings.set('face_tags_scope', scope)
     
     def close(self):
         if self._tray_icon:

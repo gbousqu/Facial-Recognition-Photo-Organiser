@@ -382,6 +382,25 @@
             gap: 24px;
         }
 
+        .face-tags-controls {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .face-tags-control {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .face-tags-label {
+            font-size: 12px;
+            color: #a0a0a0;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
         .size-control {
             display: flex;
             align-items: center;
@@ -539,6 +558,18 @@
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             border-radius: 8px;
             overflow: hidden;
+        }
+
+        .grid-face-tags-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 3;
+            overflow: hidden;
+            border-radius: 8px;
         }
 
         .photo-item .kebab-menu {
@@ -1338,7 +1369,16 @@
             position: relative;
         }
 
+        .lightbox-media {
+            position: relative;
+            transform-origin: 0 0;
+            cursor: grab;
+            user-select: none;
+        }
 
+        .lightbox-media.dragging {
+            cursor: grabbing;
+        }
 
         .lightbox-nav {
             position: absolute;
@@ -1387,11 +1427,31 @@
 
         .lightbox-actions {
             position: absolute;
-            bottom: 24px;
-            right: 24px;
+            top: 24px;
+            left: 24px;
             display: flex;
             gap: 12px;
             z-index: 100003;
+        }
+
+        .lightbox-zoom-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            background: rgba(0, 0, 0, 0.55);
+            border-radius: 10px;
+        }
+
+        .lightbox-zoom-slider {
+            width: 140px;
+        }
+
+        .lightbox-zoom-value {
+            color: #ffffff;
+            font-size: 12px;
+            min-width: 44px;
+            text-align: right;
         }
 
         .lightbox-action-btn {
